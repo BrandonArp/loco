@@ -11,14 +11,15 @@ use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 pub use sqlx::PgPool;
+use sqlx::postgres::PgListener;
 use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions, PgRow},
     ConnectOptions, Row,
 };
 use std::fmt::Write;
-use tokio::{task::JoinHandle, time::sleep};
+use tokio::{sync::Notify, task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 use ulid::Ulid;
 type JobId = String;
 type JobData = JsonValue;
@@ -119,10 +120,60 @@ impl JobRegistry {
         let mut jobs = Vec::new();
 
         let interval = opts.poll_interval_sec;
+
+        // Push wakeup: a single LISTEN connection turns Postgres NOTIFYs from
+        // enqueue() into immediate wakeups for idle workers, so a job is
+        // picked up without waiting out the poll interval. One shared listener
+        // (not one per worker) keeps pool usage flat; `notify_waiters` wakes
+        // every currently-idle worker. Polling remains the backstop for a
+        // missed notification, a dropped listener, or another instance's
+        // enqueue, so `poll_interval_sec` can stay comfortably high.
+        let notify = Arc::new(Notify::new());
+        {
+            let pool = pool.clone();
+            let notify = notify.clone();
+            let listen_token = token.clone();
+            tokio::spawn(async move {
+                while !listen_token.is_cancelled() {
+                    match PgListener::connect_with(&pool).await {
+                        Ok(mut listener) => {
+                            if let Err(err) = listener.listen("loco_queue_incoming").await {
+                                warn!(error = %err, "queue LISTEN failed; relying on interval polling");
+                            } else {
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        () = listen_token.cancelled() => return,
+                                        res = listener.recv() => match res {
+                                            Ok(_) => notify.notify_waiters(),
+                                            Err(err) => {
+                                                warn!(error = %err, "queue listener dropped; reconnecting");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "queue listener connect failed; retrying");
+                        }
+                    }
+                    // Back off before reconnecting; polling covers the gap.
+                    tokio::select! {
+                        biased;
+                        () = listen_token.cancelled() => return,
+                        () = sleep(Duration::from_secs(5)) => {}
+                    }
+                }
+            });
+        }
+
         for idx in 0..opts.num_workers {
             let handlers = self.handlers.clone();
             let worker_token = token.clone(); // Clone token for this worker
             let worker_tags = tags.to_vec();
+            let notify = notify.clone();
 
             let pool = pool.clone();
             let job = tokio::spawn(async move {
@@ -180,15 +231,18 @@ impl JobRegistry {
                             error!(job_name = %job.name, "No handler registered for job");
                         }
                     } else {
-                        // Use tokio::select! to wait for interval or cancellation
+                        // Wait for a NOTIFY, the poll interval, or cancellation.
                         tokio::select! {
                             biased;
                             () = worker_token.cancelled() => {
                                 trace!(worker_id = idx, "Cancellation received during sleep, stopping worker");
                                 break;
                             }
+                            () = notify.notified() => {
+                                // A job was enqueued — check immediately.
+                            }
                             () = sleep(Duration::from_secs(interval.into())) => {
-                                // Interval elapsed, continue loop
+                                // Interval elapsed (polling backstop), continue.
                             }
                         }
                     }
@@ -286,6 +340,15 @@ pub async fn enqueue(
     .bind(tags_json)
     .execute(pool)
     .await?;
+    // Wake an idle worker now instead of on its next poll tick. Best-effort:
+    // a failure just means the job waits for the interval. NOTIFY fires on
+    // commit; enqueue runs on the autocommit pool, so it delivers at once.
+    if let Err(err) = sqlx::query("SELECT pg_notify('loco_queue_incoming', '')")
+        .execute(pool)
+        .await
+    {
+        warn!(error = %err, "queue NOTIFY failed; worker will pick up on its next poll");
+    }
     Ok(id)
 }
 

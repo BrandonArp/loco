@@ -15,10 +15,81 @@ use sqlx::{
     AssertSqlSafe, ConnectOptions,
 };
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use tokio::{sync::Notify, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use ulid::Ulid;
+
+/// The channel `enqueue` notifies and the listener subscribes to.
+const QUEUE_CHANNEL: &str = "loco_queue_incoming";
+
+/// How long to wait before rebuilding a listener connection that failed or
+/// dropped. Interval polling covers the gap, so this can be unhurried.
+const LISTENER_RETRY: Duration = Duration::from_secs(5);
+
+/// Signals idle workers that something was enqueued.
+///
+/// A process-global because [`Driver`]'s methods are static — there is no
+/// driver value to hang this on, and `wait_for_work` receives only the pool.
+/// Set once, by the first [`PgQueue::run`] to start a listener.
+///
+/// Two Postgres queues in one process would share it. The only consequence is
+/// a spurious wakeup: the woken worker finds nothing, and waits again. Being
+/// woken too often is the safe direction to be wrong in — the interval is the
+/// correctness guarantee, and the notification is only ever an optimisation.
+static QUEUE_NOTIFY: OnceLock<Arc<Notify>> = OnceLock::new();
+
+fn queue_notify() -> &'static Arc<Notify> {
+    QUEUE_NOTIFY.get_or_init(|| Arc::new(Notify::new()))
+}
+
+/// Hold one `LISTEN` connection open and wake idle workers on each `NOTIFY`.
+///
+/// One listener per process rather than one per worker, so pool usage stays
+/// flat however many workers run. Reconnects on failure with a fixed backoff;
+/// every gap is covered by the workers' interval polling, which is why this can
+/// afford to be best-effort throughout.
+fn spawn_queue_listener(pool: PgPool, token: CancellationToken) {
+    let notify = queue_notify().clone();
+    tokio::spawn(async move {
+        while !token.is_cancelled() {
+            match sqlx::postgres::PgListener::connect_with(&pool).await {
+                Ok(mut listener) => {
+                    if let Err(err) = listener.listen(QUEUE_CHANNEL).await {
+                        warn!(error = %err, "queue LISTEN failed; relying on interval polling");
+                    } else {
+                        loop {
+                            tokio::select! {
+                                biased;
+                                () = token.cancelled() => return,
+                                res = listener.recv() => match res {
+                                    // `notify_waiters` wakes only workers
+                                    // currently parked. A notification arriving
+                                    // while all workers are busy is dropped on
+                                    // purpose: a busy worker re-checks the queue
+                                    // as soon as it finishes, so there is
+                                    // nothing to remember.
+                                    Ok(_) => notify.notify_waiters(),
+                                    Err(err) => {
+                                        warn!(error = %err, "queue listener dropped; reconnecting");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => warn!(error = %err, "queue listener connect failed; retrying"),
+            }
+            tokio::select! {
+                biased;
+                () = token.cancelled() => return,
+                () = sleep(LISTENER_RETRY) => {}
+            }
+        }
+    });
+}
 
 /// [`Driver`] implementation delegating to the Postgres-specific
 /// `dequeue`/`complete_job`/`fail_job` free functions below.
@@ -45,6 +116,18 @@ impl Driver for PgDriver {
 
     async fn fail_job(pool: &Self::Pool, id: &JobId, error: &crate::Error) -> crate::Result<()> {
         fail_job(pool, id, error).await
+    }
+
+    /// Return as soon as something is enqueued, or when the interval elapses.
+    ///
+    /// The interval arm is not a fallback that only matters when the listener
+    /// is broken — it is also what covers an enqueue by another process whose
+    /// `NOTIFY` this pool never sees. Both arms are load-bearing.
+    async fn wait_for_work(_pool: &Self::Pool, interval_sec: u64) {
+        tokio::select! {
+            () = queue_notify().notified() => {}
+            () = sleep(Duration::from_secs(interval_sec)) => {}
+        }
     }
 }
 
@@ -106,6 +189,12 @@ impl QueueProvider for PgQueue {
                 }
             });
         }
+        // Push wakeup: turns each `NOTIFY` from `enqueue` into an immediate
+        // wakeup for an idle worker, so a job is picked up without waiting out
+        // `poll_interval_sec`. Polling stays the backstop, which is what lets
+        // that interval be set high without costing latency.
+        spawn_queue_listener(self.pool.clone(), self.token.clone());
+
         let handles = self.registry.lock().await.run::<PgDriver>(
             &self.pool,
             &self.run_opts,
@@ -285,6 +374,18 @@ pub async fn enqueue(
     .bind(priority.unwrap_or(0))
     .execute(pool)
     .await?;
+    // Wake an idle worker now rather than on its next tick. Best-effort: a
+    // failure here costs latency, never the job — it is already committed, and
+    // interval polling will find it. Deliberately after the INSERT, because
+    // `NOTIFY` delivers on commit and a worker woken before the row is visible
+    // would find nothing.
+    if let Err(err) = sqlx::query("SELECT pg_notify($1, '')")
+        .bind(QUEUE_CHANNEL)
+        .execute(pool)
+        .await
+    {
+        warn!(error = %err, "queue NOTIFY failed; worker will pick up on its next poll");
+    }
     Ok(id)
 }
 

@@ -124,6 +124,27 @@ pub trait Driver: Send + Sync + 'static {
         id: &JobId,
         error: &crate::Error,
     ) -> impl std::future::Future<Output = crate::Result<()>> + Send;
+
+    /// Wait until there may be work to pick up, or until `interval_sec`
+    /// elapses — whichever happens first.
+    ///
+    /// Called by [`JobRegistry::run`] when a worker finds the queue empty. The
+    /// default is a plain sleep, which is exactly the polling behaviour every
+    /// driver had before this hook existed; overriding it is how a backend that
+    /// can be *told* about new work (Postgres `LISTEN`/`NOTIFY`, say) turns an
+    /// idle worker's wait into a push wakeup.
+    ///
+    /// An override must treat the interval as a backstop rather than replace
+    /// it: a notification can be missed, a listener connection can drop, and
+    /// another instance's enqueue may not reach this process at all. Returning
+    /// early is always safe — the worker simply re-checks the queue and, if it
+    /// is still empty, waits again.
+    fn wait_for_work(
+        _pool: &Self::Pool,
+        interval_sec: u64,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        sleep(Duration::from_secs(interval_sec))
+    }
 }
 
 pub struct JobRegistry {
@@ -231,15 +252,20 @@ impl JobRegistry {
                             error!(job_name = %job.name, "No handler registered for job");
                         }
                     } else {
-                        // Use tokio::select! to wait for interval or cancellation
+                        // Wait for cancellation, or for the driver to say there
+                        // may be work. `wait_for_work` defaults to sleeping out
+                        // the interval; a driver that can be notified of new
+                        // work returns as soon as it hears about some, with the
+                        // interval still bounding the wait.
                         tokio::select! {
                             biased;
                             () = worker_token.cancelled() => {
                                 trace!(worker_id = idx, "Cancellation received during sleep, stopping worker");
                                 break;
                             }
-                            () = sleep(Duration::from_secs(interval.into())) => {
-                                // Interval elapsed, continue loop
+                            () = D::wait_for_work(&pool, interval.into()) => {
+                                // Either notified or the interval elapsed; either
+                                // way, go round and check the queue.
                             }
                         }
                     }

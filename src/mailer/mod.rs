@@ -26,6 +26,11 @@ pub struct EmailHeaders {
     pub references: Option<String>,
     pub in_reply_to: Option<String>,
     pub message_id: Option<String>,
+    /// Further headers, by name and value, sent as given: `List-Unsubscribe`
+    /// and `List-Unsubscribe-Post` (RFC 8058), say. A name that is not a valid
+    /// header name fails the send.
+    #[serde(default)]
+    pub extra: Vec<(String, String)>,
 }
 
 /// The arguments struct for specifying email details such as sender, recipient,

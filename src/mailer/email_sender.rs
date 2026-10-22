@@ -36,6 +36,28 @@ pub struct Deliveries {
     pub messages: Vec<String>,
 }
 
+/// `builder` with `headers` set on it.
+fn with_headers(
+    mut builder: lettre::message::MessageBuilder,
+    headers: &super::EmailHeaders,
+) -> Result<lettre::message::MessageBuilder> {
+    if let Some(references) = &headers.references {
+        builder = builder.header(header::References::from(references.clone()));
+    }
+    if let Some(in_reply_to) = &headers.in_reply_to {
+        builder = builder.header(header::InReplyTo::from(in_reply_to.clone()));
+    }
+    if let Some(message_id) = &headers.message_id {
+        builder = builder.header(header::MessageId::from(message_id.clone()));
+    }
+    for (name, value) in &headers.extra {
+        let name = header::HeaderName::new_from_ascii(name.clone())
+            .map_err(|e| Error::Message(format!("invalid header name {name:?}: {e}")))?;
+        builder = builder.raw_header(header::HeaderValue::new(name, value.clone()));
+    }
+    Ok(builder)
+}
+
 impl EmailSender {
     /// Creates a new `EmailSender` using the SMTP transport method based on the
     /// provided SMTP configuration.
@@ -140,15 +162,7 @@ impl EmailSender {
         }
 
         if let Some(headers) = &email.headers {
-            if let Some(references) = &headers.references {
-                builder = builder.header(header::References::from(references.clone()));
-            }
-            if let Some(in_reply_to) = &headers.in_reply_to {
-                builder = builder.header(header::InReplyTo::from(in_reply_to.clone()));
-            }
-            if let Some(message_id) = &headers.message_id {
-                builder = builder.header(header::MessageId::from(message_id.clone()));
-            }
+            builder = with_headers(builder, headers)?;
         }
 
         let msg = builder
@@ -196,15 +210,7 @@ impl EmailSender {
         }
 
         if let Some(headers) = &email.headers {
-            if let Some(references) = &headers.references {
-                builder = builder.header(header::References::from(references.clone()));
-            }
-            if let Some(in_reply_to) = &headers.in_reply_to {
-                builder = builder.header(header::InReplyTo::from(in_reply_to.clone()));
-            }
-            if let Some(message_id) = &headers.message_id {
-                builder = builder.header(header::MessageId::from(message_id.clone()));
-            }
+            builder = with_headers(builder, headers)?;
         }
 
         let msg = builder
@@ -328,6 +334,7 @@ mod tests {
             references: Some("<notification-item-123@example.com>".to_string()),
             in_reply_to: Some("<notification-item-123@example.com>".to_string()),
             message_id: Some("<notification-item-123-1234567890@example.com>".to_string()),
+            extra: Vec::new(),
         };
 
         let data = Email {
@@ -349,6 +356,54 @@ mod tests {
         ]}, {
             assert_debug_snapshot!(stub.messages());
         });
+    }
+
+    #[tokio::test]
+    async fn sends_extra_headers_as_given() {
+        let stub = StubTransport::new_ok();
+        let sender = EmailSender {
+            transport: EmailTransport::Test(stub.clone()),
+        };
+        let data = Email {
+            from: Some("test@framework.com".to_string()),
+            to: "user1@framework.com".to_string(),
+            subject: "Unsubscribable".to_string(),
+            text: "Hello".to_string(),
+            html: "<html><body>Hello</body></html>".to_string(),
+            headers: Some(crate::mailer::EmailHeaders {
+                extra: vec![
+                    (
+                        "List-Unsubscribe".to_string(),
+                        "<https://example.com/off?t=abc>".to_string(),
+                    ),
+                    (
+                        "List-Unsubscribe-Post".to_string(),
+                        "List-Unsubscribe=One-Click".to_string(),
+                    ),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(sender.mail(&data).await.is_ok());
+        let (_, message) = &stub.messages()[0];
+        assert!(
+            message.contains("List-Unsubscribe: <https://example.com/off?t=abc>\r\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"),
+            "{message}"
+        );
+
+        let bad = Email {
+            headers: Some(crate::mailer::EmailHeaders {
+                extra: vec![("Not A Name".to_string(), "x".to_string())],
+                ..Default::default()
+            }),
+            ..data
+        };
+        assert!(sender.mail(&bad).await.is_err());
     }
 
     #[tokio::test]

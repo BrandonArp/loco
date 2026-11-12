@@ -197,27 +197,21 @@ fn validation_error_response(
 
 impl IntoResponse for Error {
     /// Convert an `Error` into an HTTP response.
+    ///
+    /// Logs the error as `controller_error`, at a level set by the status it
+    /// maps to. A 4xx is the client's mistake (a missing resource, a refused
+    /// permission, a malformed request) and logs at `warn`; any other status,
+    /// a 5xx above all, logs at `error`. An error tracker that captures `error`
+    /// events then counts server faults, not client mistakes.
     #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn into_response(self) -> Response {
-        match &self {
-            Self::WithBacktrace {
-                inner,
-                backtrace: _,
-            } => {
-                tracing::error!(
-                error.msg = %inner,
-                error.details = ?inner,
-                "controller_error"
-                );
-            }
-            err => {
-                tracing::error!(
-                error.msg = %err,
-                error.details = ?err,
-                "controller_error"
-                );
-            }
-        }
+        // The log fields, taken before the match below consumes `self`. A
+        // backtrace-wrapped error has none: its arm hands the wrapped error
+        // back to this function, which logs it once, at its own level.
+        let fields = match &self {
+            Self::WithBacktrace { .. } => None,
+            err => Some((err.to_string(), format!("{err:?}"))),
+        };
 
         let public_facing_error = match self {
             Self::NotFound => (
@@ -353,6 +347,13 @@ impl IntoResponse for Error {
             ),
         };
 
+        if let Some((msg, details)) = fields {
+            if public_facing_error.0.is_client_error() {
+                tracing::warn!(error.msg = %msg, error.details = %details, "controller_error");
+            } else {
+                tracing::error!(error.msg = %msg, error.details = %details, "controller_error");
+            }
+        }
         (public_facing_error.0, Json(public_facing_error.1)).into_response()
     }
 }
@@ -520,6 +521,84 @@ mod tests {
                 "error": "Bad Request",
                 "description": "x"
             })
+        );
+    }
+
+    /// The levels `into_response` logs `controller_error` at, for one error.
+    fn controller_error_levels(err: Error) -> Vec<tracing::Level> {
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if event.metadata().fields().field("error.msg").is_some() {
+                    self.0.lock().unwrap().push(*event.metadata().level());
+                }
+            }
+        }
+
+        let levels = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Levels(levels.clone()));
+        tracing::subscriber::with_default(subscriber, || drop(err.into_response()));
+        let levels = levels.lock().unwrap().clone();
+        levels
+    }
+
+    #[test]
+    fn client_errors_log_at_warn() {
+        for err in [
+            Error::NotFound,
+            Error::Unauthorized("no".to_string()),
+            Error::BadRequest("x".to_string()),
+            Error::CustomError(StatusCode::FORBIDDEN, ErrorDetail::with_reason("forbidden")),
+        ] {
+            let name = format!("{err:?}");
+            assert_eq!(
+                controller_error_levels(err),
+                [tracing::Level::WARN],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_errors_log_at_error() {
+        for err in [
+            Error::InternalServerError,
+            Error::Message("boom".to_string()),
+            Error::CustomError(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorDetail::with_reason("unavailable"),
+            ),
+        ] {
+            let name = format!("{err:?}");
+            assert_eq!(
+                controller_error_levels(err),
+                [tracing::Level::ERROR],
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backtrace_wrapped_error_logs_once_at_its_own_level() {
+        let wrapped = |inner| Error::WithBacktrace {
+            inner: Box::new(inner),
+            backtrace: Box::new(std::backtrace::Backtrace::force_capture()),
+        };
+        assert_eq!(
+            controller_error_levels(wrapped(Error::NotFound)),
+            [tracing::Level::WARN]
+        );
+        assert_eq!(
+            controller_error_levels(wrapped(Error::InternalServerError)),
+            [tracing::Level::ERROR]
         );
     }
 }
